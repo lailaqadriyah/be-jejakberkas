@@ -251,4 +251,102 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
   }
 });
 
+// ======================================================================
+// 4. ENDPOINT LIST BERKAS (DENGAN FILTER, SEARCH, PAGINATION)
+// ======================================================================
+router.get('/berkas', async (req, res) => {
+  try {
+    const { status, tahapan, search, page = 1, limit = 10 } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+
+    let query = db.collection('pelayanan_berkas');
+    let countQuery = db.collection('pelayanan_berkas');
+
+    if (status) {
+      query = query.where('posisi_berkas', '==', status);
+      countQuery = countQuery.where('posisi_berkas', '==', status);
+    }
+    if (tahapan) {
+      query = query.where('tahapan_sekarang', '==', tahapan);
+      countQuery = countQuery.where('tahapan_sekarang', '==', tahapan);
+    }
+
+    // Hitung total dulu
+    const countSnapshot = await countQuery.get();
+    const total = countSnapshot.size;
+
+    // Ambil data dengan offset & limit
+    let snapshot;
+    if (search) {
+      // Firestore gak support full-text search, ambil semua & filter manual
+      const allDocs = await query.orderBy('waktu_pendaftaran_awal', 'desc').get();
+      let results = [];
+      allDocs.forEach(doc => {
+        const d = doc.data();
+        const searchLower = search.toLowerCase();
+        if (
+          (d.nama_warga && d.nama_warga.toLowerCase().includes(searchLower)) ||
+          (d.no_registrasi && d.no_registrasi.toLowerCase().includes(searchLower)) ||
+          (d.nik_warga && d.nik_warga.includes(search))
+        ) {
+          results.push({ id: doc.id, ...d });
+        }
+      });
+      const totalFiltered = results.length;
+      const paginated = results.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+      return res.status(200).json({ success: true, data: paginated, total: totalFiltered, page: pageNum, limit: limitNum });
+    } else {
+      snapshot = await query.orderBy('waktu_pendaftaran_awal', 'desc').offset((pageNum - 1) * limitNum).limit(limitNum).get();
+    }
+
+    const berkasList = [];
+    snapshot.forEach(doc => {
+      berkasList.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.status(200).json({ success: true, data: berkasList, total, page: pageNum, limit: limitNum });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ======================================================================
+// 5. ENDPOINT STATISTIK DASHBOARD
+// ======================================================================
+router.get('/berkas/stats', async (req, res) => {
+  try {
+    const semuaSnapshot = await db.collection('pelayanan_berkas').get();
+    let total = 0;
+    let selesai = 0;
+    const countByPosition = {};
+
+    semuaSnapshot.forEach(doc => {
+      total++;
+      const d = doc.data();
+      if (d.waktu_berkas_diterima_warga) {
+        selesai++;
+      }
+      const pos = d.posisi_berkas || 'UNKNOWN';
+      countByPosition[pos] = (countByPosition[pos] || 0) + 1;
+    });
+
+    const menunggu_ttd = countByPosition['MENUNGGU_TTD_CAMAT'] || 0;
+    const sedang_diproses = total - selesai;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        total_berkas: total,
+        sedang_diproses,
+        menunggu_ttd,
+        selesai,
+        detail_status: countByPosition
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 module.exports = router;

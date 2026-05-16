@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/firebase');
+const admin = require('firebase-admin');
 
 // ==========================================
 // 1. ENDPOINT TAMBAH STAF / PEGAWAI BARU
@@ -20,7 +21,7 @@ router.post('/tambah-staf', async (req, res) => {
     // Simpan ke collection 'staf_performa' dengan ID dokumen kustom (id_staf)
     await db.collection('staf_performa').doc(id_staf).set({
       nama_lengkap,
-      role, // Pilihan role: 'staff_kecamatan', 'camat', 'bupati', 'staff_dinas', 'kepala_dinas'
+      role, // Pilihan role: 'staff_kecamatan', 'camat', 'staff_dinas', 'kepala_dinas', 'bidang_organisasi'
       atasan_id: atasan_id || null, // ID atasan langsung untuk sistem monitoring berjenjang
       poin_penalti: 0, // Nilai default poin penalti awal
       status_aktif: true
@@ -85,6 +86,34 @@ router.post('/login', async (req, res) => {
       }
     });
 
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==========================================
+// 3. ENDPOINT UPDATE KEHADIRAN CAMAT
+// ==========================================
+router.put('/kondisi/kehadiran', async (req, res) => {
+  try {
+    const { id_kecamatan, camat_hadir } = req.body;
+
+    if (!id_kecamatan || camat_hadir === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "id_kecamatan dan camat_hadir wajib diisi."
+      });
+    }
+
+    await db.collection('kondisi_operasional').doc(id_kecamatan).set({
+      camat_hadir: camat_hadir ? 1 : 0,
+      updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.status(200).json({
+      success: true,
+      message: `Status kehadiran camat ${id_kecamatan} diperbarui.`
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
