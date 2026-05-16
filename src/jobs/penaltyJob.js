@@ -9,9 +9,9 @@ cron.schedule('0 * * * *', async () => {
     const batasWaktu = new Date();
     batasWaktu.setHours(batasWaktu.getHours() - 24); // Batas 24 jam ke belakang
 
-    // Ambil berkas yang belum selesai dan sudah lewat 24 jam
+    // Ambil berkas yang belum kena penalti dan sudah lewat 24 jam
+    // Filter posisi_berkas selesai dilakukan di JS untuk hindari composite index
     const snapshot = await db.collection('pelayanan_berkas')
-      .where('posisi_berkas', '!=', 'SELESAI')
       .where('is_penalty_triggered', '==', false)
       .where('waktu_masuk_tahap_ini', '<', batasWaktu)
       .get();
@@ -21,10 +21,15 @@ cron.schedule('0 * * * *', async () => {
       return;
     }
 
+    const selesaiSet = new Set(['SIAP_DIAMBIL_DI_KECAMATAN', 'DOKUMEN_SELESAI']);
     const batch = db.batch();
+    let count = 0;
 
     snapshot.forEach(doc => {
       const data = doc.data();
+      // Skip berkas yang sudah selesai
+      if (selesaiSet.has(data.posisi_berkas)) return;
+      count++;
       const berkasRef = db.collection('pelayanan_berkas').doc(doc.id);
       const stafRef = db.collection('staf_performa').doc(data.penanggung_jawab_id);
 
@@ -37,8 +42,12 @@ cron.schedule('0 * * * *', async () => {
       });
     });
 
+    if (count === 0) {
+      console.log("Tidak ada berkas aktif yang melanggar SLA.");
+      return;
+    }
     await batch.commit();
-    console.log(`Berhasil memperbarui penalti untuk ${snapshot.size} berkas.`);
+    console.log(`Berhasil memperbarui penalti untuk ${count} berkas.`);
   } catch (error) {
     console.error("Gagal menjalankan cron penalti:", error);
   }

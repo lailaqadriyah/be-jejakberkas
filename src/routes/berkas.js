@@ -200,6 +200,8 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
     const { no_registrasi } = req.params;
     const { posisi_berkas_baru, penanggung_jawab_baru_id, tahapan_baru, keterangan_log } = req.body;
 
+    console.info(`[update-status] request for ${no_registrasi}`, { posisi_berkas_baru, penanggung_jawab_baru_id, tahapan_baru });
+
     const berkasRef = db.collection('pelayanan_berkas').doc(no_registrasi);
     const doc = await berkasRef.get();
 
@@ -220,30 +222,101 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
     }
 
     // LOGIKA PENUTUPAN OTOMATIS BERDASARKAN BLUEPRINT
-    if (posisi_berkas_baru === 'SELESAI_KECAMATAN') {
+    const masukDinasSet = ['KONFIRMASI_WARGA_KE_DINAS', 'VERIFIKASI_BERKAS_DINAS', 'VERIFIKASI_SIAK'];
+    const selesaiKecamatanSet = ['SELESAI_KECAMATAN'];
+    const selesaiDinasSet = ['DOKUMEN_DIKIRIM_KE_KECAMATAN', 'DOKUMEN_SELESAI'];
+    const produksiDoneSet = ['PROSES_CETAK_KTP','PROSES_CETAK_KK','PROSES_CETAK_REGISTER','PROSES_CETAK'];
+    const diterimaWargaSet = ['SELESAI_DIAMBIL', 'SIAP_DIAMBIL_DI_KECAMATAN'];
+
+    if (selesaiKecamatanSet.includes(posisi_berkas_baru)) {
       updateData.waktu_selesai_kecamatan = admin.firestore.FieldValue.serverTimestamp();
-    } else if (posisi_berkas_baru === 'VERIFIKASI_SIAK' || posisi_berkas_baru === 'ANTREAN_LOKET_DINAS' || posisi_berkas_baru === 'VERIFIKASI_BERKAS_DINAS') {
+      // Setelah kecamatan selesai, pindahkan ke status konfirmasi di Dinas agar masuk antrian Dinas
+      updateData.tahapan_sekarang = 'DINAS';
+      updateData.posisi_berkas = 'KONFIRMASI_WARGA_KE_DINAS';
       updateData.waktu_masuk_dinas = admin.firestore.FieldValue.serverTimestamp();
-    } else if (posisi_berkas_baru === 'DOKUMEN_DIKIRIM_KE_KECAMATAN') {
+    }
+    if (masukDinasSet.includes(posisi_berkas_baru)) {
+      updateData.waktu_masuk_dinas = admin.firestore.FieldValue.serverTimestamp();
+
+      // Jika masuk ke tahapan DINAS, bangun urutan langkah dinamis berdasarkan layanan & sub_layanan
+      const layananId = currentData.layanan || currentData.layanan === 0 ? currentData.layanan : null;
+      const subLayananId = currentData.sub_layanan || currentData.sub_layanan === 0 ? currentData.sub_layanan : null;
+
+      const buildDinasSequence = (layanan, sub) => {
+        // 1: KTP, 2: KK, 3: AKTA
+        if (layanan === 1) {
+          if (sub === 1) return ['ANTREAN_LOKET_DINAS', 'REKAM_BIOMETRIK', 'VALIDASI_DATA_TUNGGAL', 'PROSES_CETAK_KTP'];
+          if (sub === 2) return ['VERIFIKASI_SIAK', 'VALIDASI_PENGAJUAN_KTP_RUSAK', 'ANTREAN_CETAK', 'PROSES_CETAK_KTP'];
+          if (sub === 3) return ['VERIFIKASI_SIAK', 'PROSES_PERUBAHAN_BIODATA', 'VALIDASI_PERUBAHAN_DATA', 'ANTREAN_CETAK', 'PROSES_CETAK_KTP'];
+        }
+        if (layanan === 2) {
+          if (sub === 1) return ['VERIFIKASI_BERKAS_DINAS', 'ENTRI_DRAF_KK', 'VALIDASI_PEJABAT_TERKAIT', 'SERTIFIKASI_TTE_KADIS', 'PROSES_CETAK_KK'];
+          if (sub === 2) return ['VERIFIKASI_SIAK', 'VALIDASI_PEJABAT_DISDUKCAPIL', 'PENGAJUAN_TTE_KADIS', 'MENUNGGU_PERSETUJUAN_BSRE', 'PROSES_CETAK_KK'];
+          if (sub === 3) return ['VERIFIKASI_DATA_DUKUNG_PERUBAHAN', 'UPDATE_DATA_SIAK', 'VALIDASI_DRAF_KK_BARU', 'PENGAJUAN_TTE_KADIS', 'MENUNGGU_PERSETUJUAN_BSRE', 'PROSES_CETAK_KK'];
+        }
+        if (layanan === 3) {
+          if (sub === 1) return ['VERIFIKASI_SIAK_DAN_LOKET', 'VALIDASI_KASI_PENCATATAN_SIPIL', 'VERIFIKASI_DRAF_PRODUKSI', 'PENGAJUAN_TTE_KADIS', 'MENUNGGU_PERSETUJUAN_BSRE', 'PROSES_CETAK_REGISTER'];
+          if (sub === 2) return ['VERIFIKASI_DATA_REGISTRASI', 'PEMBUATAN_DUPLIKAT_AKTA', 'REKAM_DATABASE_KEPENDUDUKAN', 'TANDA_TANGAN_KADIS'];
+          if (sub === 3) return ['VERIFIKASI_SIAK_DAN_LOKET', 'VALIDASI_KASI_PENCATATAN_SIPIL', 'PEMBETULAN_INPUTAN_DATA', 'VERIFIKASI_DRAF_PRODUKSI', 'PENGAJUAN_TTE_KADIS', 'MENUNGGU_PERSETUJUAN_BSRE', 'PROSES_CETAK_REGISTER'];
+        }
+        // fallback generic dinas flow
+        return ['VERIFIKASI_BERKAS_DINAS', 'VERIFIKASI_SIAK', 'PROSES_CETAK', 'VALIDASI_PEJABAT', 'DOKUMEN_SELESAI', 'SIAP_DIAMBIL_DI_KECAMATAN'];
+      };
+
+      try {
+        const seq = buildDinasSequence(layananId, subLayananId);
+        if (seq && seq.length > 0) {
+          updateData.dinas_sequence = seq;
+          // jika posisi_berkas_baru spesifik bukan bagian dari seq, set ke seq[0]
+          if (!seq.includes(posisi_berkas_baru)) {
+            updateData.posisi_berkas = seq[0];
+          }
+          // set tahapan jika belum diset
+          updateData.tahapan_sekarang = 'DINAS';
+        }
+      } catch (e) {
+        console.warn('[update-status] gagal membangun dinas_sequence:', e.message || e);
+      }
+    }
+    if (selesaiDinasSet.includes(posisi_berkas_baru)) {
       updateData.waktu_selesai_dinas = admin.firestore.FieldValue.serverTimestamp();
-    } else if (posisi_berkas_baru === 'SELESAI_DIAMBIL') {
+    }
+
+    // Jika pelaksanaan cetak selesai (posisi produksi), otomatis tandai sebagai dikirim ke kecamatan
+    if (produksiDoneSet.includes(posisi_berkas_baru)) {
+      updateData.waktu_selesai_dinas = admin.firestore.FieldValue.serverTimestamp();
+      updateData.posisi_berkas = 'DOKUMEN_DIKIRIM_KE_KECAMATAN';
+      // tambahkan ke history akan mencatat posisi DOKUMEN_DIKIRIM_KE_KECAMATAN
+    }
+    if (diterimaWargaSet.includes(posisi_berkas_baru)) {
       updateData.waktu_berkas_diterima_warga = admin.firestore.FieldValue.serverTimestamp();
     }
 
+    // Simpan update dan catatan riwayat
     await berkasRef.update(updateData);
+    try {
+      const finalPos = updateData.posisi_berkas || posisi_berkas_baru;
+      await berkasRef.collection('history').add({
+        tahapan: updateData.tahapan_sekarang || tahapan_baru || currentData.tahapan_sekarang,
+        posisi_berkas: finalPos,
+        waktu: admin.firestore.FieldValue.serverTimestamp(),
+        keterangan: keterangan_log || `Berkas bergeser ke posisi: ${finalPos}`,
+        penanggung_jawab_id: penanggung_jawab_baru_id
+      });
+    } catch (histErr) {
+      console.error(`[update-status] gagal menambahkan history untuk ${no_registrasi}:`, histErr.message || histErr);
+    }
 
-    // Tambah entri riwayat baru
-    await berkasRef.collection('history').add({
-      tahapan: tahapan_baru || currentData.tahapan_sekarang,
-      posisi_berkas: posisi_berkas_baru,
-      waktu: admin.firestore.FieldValue.serverTimestamp(),
-      keterangan: keterangan_log || `Berkas bergeser ke posisi: ${posisi_berkas_baru}`,
-      penanggung_jawab_id: penanggung_jawab_baru_id
-    });
+    // Ambil kembali dokumen terbaru untuk dikembalikan ke client
+    const updatedDoc = await berkasRef.get();
+    const updatedData = updatedDoc.exists ? updatedDoc.data() : null;
+
+    console.info(`[update-status] selesai untuk ${no_registrasi}`, { updatedPosisi: updatedData?.posisi_berkas });
 
     res.status(200).json({
       success: true,
-      message: `Status berkas ${no_registrasi} berhasil diperbarui ke posisi ${posisi_berkas_baru}.`
+      message: `Status berkas ${no_registrasi} berhasil diperbarui ke posisi ${posisi_berkas_baru}.`,
+      data: updatedData
     });
 
   } catch (error) {
@@ -280,9 +353,17 @@ router.get('/berkas', async (req, res) => {
     let snapshot;
     if (search) {
       // Firestore gak support full-text search, ambil semua & filter manual
-      const allDocs = await query.orderBy('waktu_pendaftaran_awal', 'desc').get();
+      let allDocsSnap;
+      try {
+        allDocsSnap = await query.orderBy('waktu_pendaftaran_awal', 'desc').get();
+      } catch (e) {
+        // Jika Firestore meminta composite index, fallback ke ambil tanpa orderBy
+        if (e.message && e.message.includes('requires an index')) {
+          allDocsSnap = await query.get();
+        } else throw e;
+      }
       let results = [];
-      allDocs.forEach(doc => {
+      allDocsSnap.forEach(doc => {
         const d = doc.data();
         const searchLower = search.toLowerCase();
         if (
@@ -297,7 +378,24 @@ router.get('/berkas', async (req, res) => {
       const paginated = results.slice((pageNum - 1) * limitNum, pageNum * limitNum);
       return res.status(200).json({ success: true, data: paginated, total: totalFiltered, page: pageNum, limit: limitNum });
     } else {
-      snapshot = await query.orderBy('waktu_pendaftaran_awal', 'desc').offset((pageNum - 1) * limitNum).limit(limitNum).get();
+      try {
+        snapshot = await query.orderBy('waktu_pendaftaran_awal', 'desc').offset((pageNum - 1) * limitNum).limit(limitNum).get();
+      } catch (e) {
+        // Jika gagal karena index yang hilang, ambil semua dokumen matching query, sort di server, lalu paginasi manual
+        if (e.message && e.message.includes('requires an index')) {
+          const allSnap = await query.get();
+          const allDocs = [];
+          allSnap.forEach(doc => allDocs.push({ id: doc.id, ...doc.data() }));
+          allDocs.sort((a, b) => {
+            const ta = a.waktu_pendaftaran_awal ? (a.waktu_pendaftaran_awal._seconds || 0) : 0;
+            const tb = b.waktu_pendaftaran_awal ? (b.waktu_pendaftaran_awal._seconds || 0) : 0;
+            return tb - ta;
+          });
+          const paginated = allDocs.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+          return res.status(200).json({ success: true, data: paginated, total: allDocs.length, page: pageNum, limit: limitNum });
+        }
+        throw e;
+      }
     }
 
     const berkasList = [];
