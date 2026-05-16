@@ -1,52 +1,249 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../firebase'); // Import koneksi db dari langkah 2
+const db = require('../config/firebase');
 const admin = require('firebase-admin');
+const axios = require('axios');
 
+// ======================================================================
+// 1. ENDPOINT PENDAFTARAN BERKAS (FASE KECAMATAN - BERURUTAN SESUAI ANTRIAN)
+// ======================================================================
 router.post('/daftar-berkas', async (req, res) => {
   try {
-    const { nama_warga, nik, id_layanan, id_sub_layanan, penanggung_jawab_id } = req.body;
+    const { 
+      nama_warga, nik_warga, no_kk, no_hp, 
+      kecamatan, kelurahan, alamat, catatan_staff, 
+      layanan, sub_layanan, penanggung_jawab_id, id_kecamatan_asal 
+    } = req.body;
+
+    // ------------------------------------------------------------------
+    // LOGIKA GENERATE NOMOR REGISTRASI BERURUTAN (AZ001, AZ002, dst.)
+    // ------------------------------------------------------------------
+    const counterRef = db.collection('counters').doc('pelayanan_berkas');
     
-    // 1. Generate Nomor Registrasi Unik (Contoh: AZ005)
-    // Anda bisa membuat fungsi kustom untuk generate ID ini
-    const no_registrasi = "AZ005"; 
+    const nextQueueNumber = await db.runTransaction(async (transaction) => {
+      const counterDoc = await transaction.get(counterRef);
+      let currentNumber = 0;
+      
+      if (counterDoc.exists) {
+        currentNumber = counterDoc.data().last_number || 0;
+      }
+      
+      const nextNumber = currentNumber + 1;
+      transaction.set(counterRef, { last_number: nextNumber }, { merge: true });
+      return nextNumber;
+    });
 
-    // 2. Hitung estimasi waktu lewat Machine Learning Engine (FastAPI)
-    // const mlResponse = await axios.post('URL_FASTAPI_KAMU/predict', { ... });
-    const estimasi_ml = {
-      predicted_minutes: 45,
-      range: "40 - 50 menit",
-      workload_score: 120,
-      is_overloaded: false,
-      factors: ["Waktu pendaftaran bertepatan dengan jam istirahat layanan."]
-    };
+    // Format menjadi AZ dilanjutkan 3 digit angka berurutan (misal: AZ001, AZ002)
+    const no_registrasi = `AZ${nextQueueNumber.toString().padStart(3, '0')}`;
 
-    // 3. Susun data sesuai dengan rancangan struktur fiks
+    // ------------------------------------------------------------------
+    // LOGIKA HITUNG BEBAN KERJA STAF (Menjawab pertanyaan antrean staf)
+    // ------------------------------------------------------------------
+    const berkasAktifStaf = await db.collection('pelayanan_berkas')
+      .where('penanggung_jawab_id', '==', penanggung_jawab_id)
+      .where('waktu_berkas_diterima_warga', '==', null)
+      .get();
+    
+    // Jumlah berkas yang sedang dipegang oleh staf ini saat ini
+    const jumlahAntreanStaf = berkasAktifStaf.size; 
+
+    // ------------------------------------------------------------------
+    // AMBIL DATA KEHADIRAN CAMAT
+    // ------------------------------------------------------------------
+    const kondisiRef = db.collection('kondisi_operasional').doc(id_kecamatan_asal || 'kuranji'); 
+    const kondisiDoc = await kondisiRef.get();
+    let camatHadir = 1; 
+    if (kondisiDoc.exists && kondisiDoc.data().camat_hadir !== undefined) {
+      camatHadir = kondisiDoc.data().camat_hadir; 
+    }
+
+    // ------------------------------------------------------------------
+    // HITUNG ESTIMASI LEWAT API MACHINE LEARNING (FASTAPI)
+    // ------------------------------------------------------------------
+    let estimasi_ml;
+    try {
+      const mlResponse = await axios.post('http://localhost:8000/predict/kecamatan', {
+        id_layanan: layanan,
+        id_sub_layanan: sub_layanan,
+        waktu_pendaftaran: new Date().toISOString(),
+        status_camat: camatHadir,
+        beban_staf: jumlahAntreanStaf // Mengirim data antrean riil staf ke ML
+      });
+      estimasi_ml = mlResponse.data; 
+    } catch (mlError) {
+      console.warn("Gagal menghubungi server ML, menggunakan estimasi default.");
+      estimasi_ml = {
+        predicted_minutes: 45,
+        range: "40 - 50 menit",
+        workload_score: 98 + jumlahAntreanStaf,
+        is_overloaded: false,
+        factors: ["Sistem AI sedang offline, menggunakan estimasi standar backend."],
+        calculated_at: new Date().toISOString()
+      };
+    }
+
+    // ------------------------------------------------------------------
+    // STRUKTUR DATA SESUAI CETAK BIRU FINAL
+    // ------------------------------------------------------------------
     const dataBerkas = {
       no_registrasi,
+      id_kecamatan_asal: id_kecamatan_asal || "kuranji",
       nama_warga,
-      nik,
-      id_layanan,
-      id_sub_layanan,
+      nik_warga,
+      no_kk: no_kk || null,
+      no_hp: no_hp || null,
+      kecamatan: kecamatan || null,
+      kelurahan: kelurahan || null,
+      alamat: alamat || null,
+      catatan_staff: catatan_staff || null,
+      layanan: parseInt(layanan) || 1,
+      sub_layanan: parseInt(sub_layanan) || 1,
       tahapan_sekarang: "KECAMATAN",
-      posisi_berkas: "VERIFIKASI_STAFF",
+      posisi_berkas: "VERIFIKASI_BERKAS_KECAMATAN", // Menggunakan nilai baku baru
       penanggung_jawab_id,
-      waktu_masuk_tahap_ini: admin.firestore.FieldValue.serverTimestamp(), // Menggunakan tipe data Timestamp Firestore
+      waktu_masuk_tahap_ini: admin.firestore.FieldValue.serverTimestamp(),
       is_penalty_triggered: false,
       waktu_pendaftaran_awal: admin.firestore.FieldValue.serverTimestamp(),
-      waktu_selesai_total: null,
-      durasi_aktual_menit: null,
+      waktu_selesai_kecamatan: null,
+      durasi_aktual_kecamatan: null,
+      waktu_masuk_dinas: null,
+      waktu_selesai_dinas: null,
+      durasi_aktual_dinas: null,
+      waktu_berkas_diterima_warga: null,
       estimasi_ml_kecamatan: estimasi_ml,
       estimasi_ml_dinas: null
     };
 
-    // 4. Simpan ke Firestore dengan ID Dokumen kustom (no_registrasi)
+    // Simpan dokumen utama
     await db.collection('pelayanan_berkas').doc(no_registrasi).set(dataBerkas);
+
+    // Catat riwayat log awal
+    await db.collection('pelayanan_berkas').doc(no_registrasi).collection('history').add({
+      tahapan: "KECAMATAN",
+      posisi_berkas: "VERIFIKASI_BERKAS_KECAMATAN",
+      waktu: admin.firestore.FieldValue.serverTimestamp(),
+      keterangan: "Berkas fisik berhasil diverifikasi di loket kecamatan dan masuk antrean.",
+      penanggung_jawab_id
+    });
 
     res.status(201).json({
       success: true,
-      message: "Berkas berhasil didaftarkan",
-      no_registrasi
+      message: "Berkas berhasil didaftarkan sesuai nomor urut antrean.",
+      no_registrasi,
+      estimasi: estimasi_ml
+    });
+
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ======================================================================
+// 2. ENDPOINT TRACKING LENGKAP (GABUNGAN DATA UTAMA, HISTORY & SLA)
+// ======================================================================
+router.get('/tracking/:no_registrasi', async (req, res) => {
+  try {
+    const { no_registrasi } = req.params;
+
+    const berkasRef = db.collection('pelayanan_berkas').doc(no_registrasi);
+    const doc = await berkasRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: "Nomor registrasi berkas tidak ditemukan." });
+    }
+
+    const dataBerkas = doc.data();
+
+    // Ambil data subcollection history
+    const historySnapshot = await berkasRef.collection('history').orderBy('waktu', 'asc').get();
+    let historyData = [];
+    historySnapshot.forEach(hDoc => {
+      historyData.push({ id: hDoc.id, ...hDoc.data() });
+    });
+
+    // Kalkulasi hitung mundur waktu
+    let estimasiWaktuSelesai = null;
+    let sisaWaktuMenit = null;
+
+    if (dataBerkas.waktu_pendaftaran_awal && dataBerkas.estimasi_ml_kecamatan) {
+      const waktuDaftar = dataBerkas.waktu_pendaftaran_awal.toDate(); 
+      const tambahanMenit = dataBerkas.estimasi_ml_kecamatan.predicted_minutes || 45;
+      estimasiWaktuSelesai = new Date(waktuDaftar.getTime() + tambahanMenit * 60000);
+      
+      const waktuSekarang = new Date();
+      sisaWaktuMenit = Math.round((estimasiWaktuSelesai - waktuSekarang) / 60000);
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        ...dataBerkas,
+        kalkulasi_sla: {
+          estimasi_selesai: estimasiWaktuSelesai,
+          sisa_waktu_menit: sisaWaktuMenit > 0 ? sisaWaktuMenit : 0,
+          status_peringatan: sisaWaktuMenit <= 15 ? "Kritis" : "Aman"
+        },
+        history: historyData
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ======================================================================
+// 3. ENDPOINT UPDATE STATUS (SINKRONISASI 9 JALUR STEPPER BERKAS)
+// ======================================================================
+router.put('/update-status/:no_registrasi', async (req, res) => {
+  try {
+    const { no_registrasi } = req.params;
+    const { posisi_berkas_baru, penanggung_jawab_baru_id, tahapan_baru, keterangan_log } = req.body;
+
+    const berkasRef = db.collection('pelayanan_berkas').doc(no_registrasi);
+    const doc = await berkasRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: "Berkas tidak ditemukan" });
+    }
+
+    const currentData = doc.data();
+    const updateData = {
+      posisi_berkas: posisi_berkas_baru,
+      penanggung_jawab_id: penanggung_jawab_baru_id,
+      waktu_masuk_tahap_ini: admin.firestore.FieldValue.serverTimestamp(),
+      is_penalty_triggered: false 
+    };
+
+    if (tahapan_baru) {
+      updateData.tahapan_sekarang = tahapan_baru;
+    }
+
+    // LOGIKA PENUTUPAN OTOMATIS BERDASARKAN BLUEPRINT
+    if (posisi_berkas_baru === 'SELESAI_KECAMATAN') {
+      updateData.waktu_selesai_kecamatan = admin.firestore.FieldValue.serverTimestamp();
+    } else if (posisi_berkas_baru === 'VERIFIKASI_SIAK' || posisi_berkas_baru === 'ANTREAN_LOKET_DINAS' || posisi_berkas_baru === 'VERIFIKASI_BERKAS_DINAS') {
+      updateData.waktu_masuk_dinas = admin.firestore.FieldValue.serverTimestamp();
+    } else if (posisi_berkas_baru === 'DOKUMEN_DIKIRIM_KE_KECAMATAN') {
+      updateData.waktu_selesai_dinas = admin.firestore.FieldValue.serverTimestamp();
+    } else if (posisi_berkas_baru === 'SELESAI_DIAMBIL') {
+      updateData.waktu_berkas_diterima_warga = admin.firestore.FieldValue.serverTimestamp();
+    }
+
+    await berkasRef.update(updateData);
+
+    // Tambah entri riwayat baru
+    await berkasRef.collection('history').add({
+      tahapan: tahapan_baru || currentData.tahapan_sekarang,
+      posisi_berkas: posisi_berkas_baru,
+      waktu: admin.firestore.FieldValue.serverTimestamp(),
+      keterangan: keterangan_log || `Berkas bergeser ke posisi: ${posisi_berkas_baru}`,
+      penanggung_jawab_id: penanggung_jawab_baru_id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Status berkas ${no_registrasi} berhasil diperbarui ke posisi ${posisi_berkas_baru}.`
     });
 
   } catch (error) {
