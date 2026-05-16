@@ -230,10 +230,6 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
 
     if (selesaiKecamatanSet.includes(posisi_berkas_baru)) {
       updateData.waktu_selesai_kecamatan = admin.firestore.FieldValue.serverTimestamp();
-      // Setelah kecamatan selesai, pindahkan ke status konfirmasi di Dinas agar masuk antrian Dinas
-      updateData.tahapan_sekarang = 'DINAS';
-      updateData.posisi_berkas = 'KONFIRMASI_WARGA_KE_DINAS';
-      updateData.waktu_masuk_dinas = admin.firestore.FieldValue.serverTimestamp();
     }
     if (masukDinasSet.includes(posisi_berkas_baru)) {
       updateData.waktu_masuk_dinas = admin.firestore.FieldValue.serverTimestamp();
