@@ -210,11 +210,25 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
     }
 
     const currentData = doc.data();
+    
+    // LOGIKA PENALTI OTOMATIS
+    let isLate = currentData.is_penalty_triggered || false;
+    if (currentData.waktu_masuk_tahap_ini && currentData.estimasi_ml_kecamatan) {
+      const startTime = currentData.waktu_masuk_tahap_ini.toDate();
+      const predictedMinutes = currentData.estimasi_ml_kecamatan.predicted_minutes || 45;
+      const now = new Date();
+      const diffMinutes = (now - startTime) / 60000;
+      
+      if (diffMinutes > predictedMinutes) {
+        isLate = true;
+      }
+    }
+
     const updateData = {
       posisi_berkas: posisi_berkas_baru,
       penanggung_jawab_id: penanggung_jawab_baru_id,
       waktu_masuk_tahap_ini: admin.firestore.FieldValue.serverTimestamp(),
-      is_penalty_triggered: false 
+      is_penalty_triggered: isLate 
     };
 
     if (tahapan_baru) {

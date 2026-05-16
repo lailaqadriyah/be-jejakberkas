@@ -8,7 +8,7 @@ const admin = require('firebase-admin');
 // ==========================================
 router.post('/tambah-staf', async (req, res) => {
   try {
-    const { id_staf, nama_lengkap, role, atasan_id } = req.body;
+    const { id_staf, nama_lengkap, role, atasan_id, username, password } = req.body;
 
     // Validasi input wajib
     if (!id_staf || !nama_lengkap || !role) {
@@ -24,7 +24,9 @@ router.post('/tambah-staf', async (req, res) => {
       role, // Pilihan role: 'staff_kecamatan', 'camat', 'staff_dinas', 'kepala_dinas', 'bidang_organisasi'
       atasan_id: atasan_id || null, // ID atasan langsung untuk sistem monitoring berjenjang
       poin_penalti: 0, // Nilai default poin penalti awal
-      status_aktif: true
+      status_aktif: true,
+      username: username || id_staf.toLowerCase(),
+      password: password || "password123"
     });
 
     res.status(201).json({
@@ -42,47 +44,92 @@ router.post('/tambah-staf', async (req, res) => {
 // ==========================================
 router.post('/login', async (req, res) => {
   try {
-    const { id_staf, nama_lengkap } = req.body;
+    const { username, password } = req.body;
+
+    // Hardcoded fallback for Hackathon/Demo (Quota Firestore fix)
+    const mockUsers = {
+      'staffkec': { id: 'STAFF_KEC_01', name: 'Siti Nurhaliza', role: 'staff_kecamatan', pass: 'kecamatan123' },
+      'camatkuranji': { id: 'CAMAT_KUR', name: 'Drs. Ahmad Fauzi', role: 'camat', pass: 'camat123' },
+      'staffdinas': { id: 'STAFF_DIN_01', name: 'Rina Pramesti', role: 'staff_dinas', pass: 'dinas123' },
+      'kadindukcapil': { id: 'KADIN_DUK', name: 'Dr. Hendra Wijaya', role: 'kepala_dinas', pass: 'kadin123' },
+      'biroorg': { id: 'BIDANG_ORG', name: 'Maya Anggraini', role: 'biro_organisasi', pass: 'biro123' }
+    };
+
+    console.log(`[Login Attempt] Username: ${username}, Password: ${password}`);
+
+    const foundMock = Object.keys(mockUsers).find(u => u.toLowerCase() === username.toLowerCase());
+    if (foundMock && mockUsers[foundMock].pass.toLowerCase() === password.toLowerCase()) {
+      console.log(`[Login Success] Fallback mode used for ${username}`);
+      return res.status(200).json({
+        success: true,
+        message: "Login berhasil (Fallback Mode)!",
+        user: {
+          id_staf: mockUsers[foundMock].id,
+          nama_lengkap: mockUsers[foundMock].name,
+          role: mockUsers[foundMock].role,
+          username: foundMock
+        }
+      });
+    }
 
     // Validasi kelengkapan data form login
-    if (!id_staf || !nama_lengkap) {
+    if (!username || !password) {
       return res.status(400).json({
         success: false,
-        message: "ID Staf dan Nama Lengkap harus diisi."
+        message: "Username dan Password harus diisi."
       });
     }
 
-    // Cari data staf berdasarkan ID dokumen di Firestore
-    const stafRef = db.collection('staf_performa').doc(id_staf);
-    const doc = await stafRef.get();
+    // 1. Cari berdasarkan field 'username'
+    let userData = null;
+    let userId = null;
+    
+    try {
+      const snapshot = await db.collection('staf_performa').where('username', '==', username).limit(1).get();
+      if (!snapshot.empty) {
+        userData = snapshot.docs[0].data();
+        userId = snapshot.docs[0].id;
+      } else {
+        // 2. Fallback: Cari berdasarkan ID Dokumen (untuk akun lama)
+        const doc = await db.collection('staf_performa').doc(username).get();
+        if (doc.exists) {
+          userData = doc.data();
+          userId = doc.id;
+        }
+      }
+    } catch (e) {
+      console.error("Firestore Error:", e.message);
+      // Jika firestore error (quota), biarkan lewat untuk dicek passwordnya (tapi userData akan null)
+    }
 
-    // Jika dokumen akun tidak ditemukan
-    if (!doc.exists) {
+    // Jika user tidak ditemukan
+    if (!userData) {
       return res.status(404).json({
         success: false,
-        message: "Akun tidak ditemukan. Silakan periksa kembali ID Staf Anda."
+        message: "Akun tidak ditemukan atau Database sibuk. Silakan gunakan kredensial demo."
       });
     }
 
-    const dataStaf = doc.data();
-
-    // Validasi kecocokan nama lengkap (sebagai kredensial login sementara)
-    if (dataStaf.nama_lengkap.toLowerCase() !== nama_lengkap.toLowerCase()) {
+    // 3. Validasi Password
+    const correctPassword = userData.password || userData.nama_lengkap;
+    
+    if (correctPassword.toLowerCase() !== password.toLowerCase()) {
       return res.status(401).json({
         success: false,
-        message: "Nama Lengkap yang Anda masukkan salah."
+        message: "Password yang Anda masukkan salah."
       });
     }
 
-    // Jika sukses, kembalikan data sesi pengguna untuk diproses oleh Frontend (Login.jsx)
+    // Jika sukses, kembalikan data sesi pengguna
     res.status(200).json({
       success: true,
       message: "Login berhasil!",
       user: {
-        id_staf: doc.id,
-        nama_lengkap: dataStaf.nama_lengkap,
-        role: dataStaf.role, 
-        atasan_id: dataStaf.atasan_id
+        id_staf: userId,
+        nama_lengkap: userData.nama_lengkap,
+        role: userData.role, 
+        atasan_id: userData.atasan_id,
+        username: userData.username || userId
       }
     });
 
@@ -114,6 +161,22 @@ router.put('/kondisi/kehadiran', async (req, res) => {
       success: true,
       message: `Status kehadiran camat ${id_kecamatan} diperbarui.`
     });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==========================================
+// 4. ENDPOINT LIST SEMUA STAF
+// ==========================================
+router.get('/staf', async (req, res) => {
+  try {
+    const snapshot = await db.collection('staf_performa').get();
+    const stafList = [];
+    snapshot.forEach(doc => {
+      stafList.push({ id: doc.id, ...doc.data() });
+    });
+    res.status(200).json({ success: true, data: stafList });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
