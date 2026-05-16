@@ -1,5 +1,7 @@
 const express = require('express');
 const app = express();
+const berkasRouter = require('./routes/berkas');
+require('./jobs/penaltyJob');
 require('dotenv').config();
 const port = process.env.PORT || 3000;
 
