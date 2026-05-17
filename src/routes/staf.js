@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/firebase');
 const admin = require('firebase-admin');
+const { runPenaltyCheck } = require('../jobs/penaltyJob');
 
 // ==========================================
 // 1. ENDPOINT TAMBAH STAF / PEGAWAI BARU
@@ -167,7 +168,19 @@ router.put('/kondisi/kehadiran', async (req, res) => {
 });
 
 // ==========================================
-// 4. ENDPOINT LIST SEMUA STAF
+// 4. TRIGGER MANUAL PENALTI (untuk testing)
+// ==========================================
+router.post('/penalty/run-now', async (req, res) => {
+  try {
+    const result = await runPenaltyCheck();
+    res.status(200).json({ success: true, message: 'Penalty check selesai.', data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==========================================
+// 5. ENDPOINT LIST SEMUA STAF
 // ==========================================
 router.get('/staf', async (req, res) => {
   try {

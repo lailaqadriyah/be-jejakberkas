@@ -62,12 +62,15 @@ router.post('/daftar-berkas', async (req, res) => {
     // ------------------------------------------------------------------
     let estimasi_ml;
     try {
+      const d = new Date();
       const mlResponse = await axios.post('http://localhost:8000/predict/kecamatan', {
-        id_layanan: layanan,
-        id_sub_layanan: sub_layanan,
-        waktu_pendaftaran: new Date().toISOString(),
-        status_camat: camatHadir,
-        beban_staf: jumlahAntreanStaf // Mengirim data antrean riil staf ke ML
+        layanan: parseInt(layanan) || 1,
+        sub_layanan: parseInt(sub_layanan) || 1,
+        posisi_berkas: 'VERIFIKASI_BERKAS_KECAMATAN',
+        antrean: jumlahAntreanStaf,
+        camat_hadir: camatHadir,
+        jam: d.getHours(),
+        hari: d.getDay(),
       });
       estimasi_ml = mlResponse.data; 
     } catch (mlError) {
@@ -161,17 +164,54 @@ router.get('/tracking/:no_registrasi', async (req, res) => {
       historyData.push({ id: hDoc.id, ...hDoc.data() });
     });
 
-    // Kalkulasi hitung mundur waktu
+    // Realtime estimasi via ML berdasarkan posisi terbaru + kondisi camat
+    let predMinutes = dataBerkas?.estimasi_ml_kecamatan?.predicted_minutes || 45;
+    let camatHadirRealtime = 1;
+    try {
+      const kondisiDoc = await db.collection('kondisi_operasional').doc(dataBerkas.id_kecamatan_asal || 'kuranji').get();
+      if (kondisiDoc.exists && kondisiDoc.data()?.camat_hadir !== undefined) {
+        camatHadirRealtime = kondisiDoc.data().camat_hadir ? 1 : 0;
+      }
+    } catch (_) {}
+
+    try {
+      const d = new Date();
+      if (dataBerkas.tahapan_sekarang === 'DINAS') {
+        const mlResp = await axios.post('http://localhost:8000/predict/dinas', {
+          layanan: dataBerkas.layanan || 1,
+          sub_layanan: dataBerkas.sub_layanan || 1,
+          posisi_berkas: dataBerkas.posisi_berkas || 'VERIFIKASI_BERKAS_DINAS',
+          antrean: 0,
+          server_siak: 1,
+        });
+        if (mlResp?.data?.predicted_minutes) predMinutes = mlResp.data.predicted_minutes;
+      } else {
+        const mlResp = await axios.post('http://localhost:8000/predict/kecamatan', {
+          layanan: dataBerkas.layanan || 1,
+          sub_layanan: dataBerkas.sub_layanan || 1,
+          posisi_berkas: dataBerkas.posisi_berkas || 'VERIFIKASI_BERKAS_KECAMATAN',
+          antrean: 0,
+          camat_hadir: camatHadirRealtime,
+          jam: d.getHours(),
+          hari: d.getDay(),
+        });
+        if (mlResp?.data?.predicted_minutes) predMinutes = mlResp.data.predicted_minutes;
+      }
+    } catch (_) {
+      // fallback ke estimasi tersimpan
+    }
+
+    // Business rule: jika menunggu TTD dan camat tidak hadir, tambah 1x24 jam
+    if (dataBerkas.posisi_berkas === 'MENUNGGU_TTD_CAMAT' && camatHadirRealtime === 0) {
+      predMinutes += 1440;
+    }
+
     let estimasiWaktuSelesai = null;
     let sisaWaktuMenit = null;
-
-    if (dataBerkas.waktu_pendaftaran_awal && dataBerkas.estimasi_ml_kecamatan) {
-      const waktuDaftar = dataBerkas.waktu_pendaftaran_awal.toDate(); 
-      const tambahanMenit = dataBerkas.estimasi_ml_kecamatan.predicted_minutes || 45;
-      estimasiWaktuSelesai = new Date(waktuDaftar.getTime() + tambahanMenit * 60000);
-      
-      const waktuSekarang = new Date();
-      sisaWaktuMenit = Math.round((estimasiWaktuSelesai - waktuSekarang) / 60000);
+    if (dataBerkas.waktu_masuk_tahap_ini) {
+      const start = dataBerkas.waktu_masuk_tahap_ini.toDate();
+      estimasiWaktuSelesai = new Date(start.getTime() + predMinutes * 60000);
+      sisaWaktuMenit = Math.round((estimasiWaktuSelesai - new Date()) / 60000);
     }
 
     res.status(200).json({
@@ -211,14 +251,55 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
 
     const currentData = doc.data();
     
-    // LOGIKA PENALTI OTOMATIS
+    // LOGIKA PENALTI OTOMATIS + hitung durasi aktual tahap saat ini (per-instansi)
     let isLate = currentData.is_penalty_triggered || false;
-    if (currentData.waktu_masuk_tahap_ini && currentData.estimasi_ml_kecamatan) {
+    let actualMinutes = null;
+    if (currentData.waktu_masuk_tahap_ini) {
       const startTime = currentData.waktu_masuk_tahap_ini.toDate();
-      const predictedMinutes = currentData.estimasi_ml_kecamatan.predicted_minutes || 45;
       const now = new Date();
       const diffMinutes = (now - startTime) / 60000;
-      
+      actualMinutes = Math.max(1, Math.round(diffMinutes));
+
+      let predictedMinutes = 45;
+      try {
+        if (currentData.tahapan_sekarang === 'DINAS') {
+          const ml = await axios.post('http://localhost:8000/predict/dinas', {
+            layanan: currentData.layanan || 1,
+            sub_layanan: currentData.sub_layanan || 1,
+            posisi_berkas: currentData.posisi_berkas || 'VERIFIKASI_BERKAS_DINAS',
+            antrean: 0,
+            server_siak: 1,
+          });
+          if (ml?.data?.predicted_minutes) predictedMinutes = ml.data.predicted_minutes;
+        } else {
+          let camatHadirRealtime = 1;
+          try {
+            const kondisiDoc = await db.collection('kondisi_operasional').doc(currentData.id_kecamatan_asal || 'kuranji').get();
+            if (kondisiDoc.exists && kondisiDoc.data()?.camat_hadir !== undefined) {
+              camatHadirRealtime = kondisiDoc.data().camat_hadir ? 1 : 0;
+            }
+          } catch (_) {}
+
+          const d = new Date();
+          const ml = await axios.post('http://localhost:8000/predict/kecamatan', {
+            layanan: currentData.layanan || 1,
+            sub_layanan: currentData.sub_layanan || 1,
+            posisi_berkas: currentData.posisi_berkas || 'VERIFIKASI_BERKAS_KECAMATAN',
+            antrean: 0,
+            camat_hadir: camatHadirRealtime,
+            jam: d.getHours(),
+            hari: d.getDay(),
+          });
+          if (ml?.data?.predicted_minutes) predictedMinutes = ml.data.predicted_minutes;
+
+          if (currentData.posisi_berkas === 'MENUNGGU_TTD_CAMAT' && camatHadirRealtime === 0) {
+            predictedMinutes += 1440;
+          }
+        }
+      } catch (_) {
+        // fallback predictedMinutes=45
+      }
+
       if (diffMinutes > predictedMinutes) {
         isLate = true;
       }
@@ -317,6 +398,33 @@ router.put('/update-status/:no_registrasi', async (req, res) => {
       console.error(`[update-status] gagal menambahkan history untuk ${no_registrasi}:`, histErr.message || histErr);
     }
 
+    // Kirim feedback ML hanya untuk tahapan Kecamatan
+    if (actualMinutes && currentData.tahapan_sekarang !== 'DINAS') {
+      try {
+        let camatHadirRealtime = 1;
+        try {
+          const kondisiDoc = await db.collection('kondisi_operasional').doc(currentData.id_kecamatan_asal || 'kuranji').get();
+          if (kondisiDoc.exists && kondisiDoc.data()?.camat_hadir !== undefined) {
+            camatHadirRealtime = kondisiDoc.data().camat_hadir ? 1 : 0;
+          }
+        } catch (_) {}
+
+        const d = new Date();
+        await axios.post('http://localhost:8000/feedback/kecamatan', {
+          layanan: currentData.layanan || 1,
+          sub_layanan: currentData.sub_layanan || 1,
+          posisi_berkas: currentData.posisi_berkas || 'VERIFIKASI_BERKAS_KECAMATAN',
+          antrean: 0,
+          camat_hadir: camatHadirRealtime,
+          jam: d.getHours(),
+          hari: d.getDay(),
+          durasi_aktual: actualMinutes,
+        });
+      } catch (mlFeedbackErr) {
+        console.warn('[update-status] feedback ML gagal:', mlFeedbackErr.message || mlFeedbackErr);
+      }
+    }
+
     // Ambil kembali dokumen terbaru untuk dikembalikan ke client
     const updatedDoc = await berkasRef.get();
     const updatedData = updatedDoc.exists ? updatedDoc.data() : null;
@@ -413,7 +521,71 @@ router.get('/berkas', async (req, res) => {
       berkasList.push({ id: doc.id, ...doc.data() });
     });
 
-    res.status(200).json({ success: true, data: berkasList, total, page: pageNum, limit: limitNum });
+    // Enrich SLA realtime via ML untuk data yang ditampilkan (halaman saat ini)
+    const enriched = await Promise.all(
+      berkasList.map(async (item) => {
+        let predMinutes = item?.estimasi_ml_kecamatan?.predicted_minutes || 45;
+        try {
+          if (item.tahapan_sekarang === 'DINAS') {
+            const ml = await axios.post('http://localhost:8000/predict/dinas', {
+              layanan: item.layanan || 1,
+              sub_layanan: item.sub_layanan || 1,
+              posisi_berkas: item.posisi_berkas || 'VERIFIKASI_BERKAS_DINAS',
+              antrean: 0,
+              server_siak: 1,
+            });
+            if (ml?.data?.predicted_minutes) predMinutes = ml.data.predicted_minutes;
+          } else {
+            let camatHadirRealtime = 1;
+            try {
+              const kondisiDoc = await db.collection('kondisi_operasional').doc(item.id_kecamatan_asal || 'kuranji').get();
+              if (kondisiDoc.exists && kondisiDoc.data()?.camat_hadir !== undefined) {
+                camatHadirRealtime = kondisiDoc.data().camat_hadir ? 1 : 0;
+              }
+            } catch (_) {}
+
+            const now = new Date();
+            const ml = await axios.post('http://localhost:8000/predict/kecamatan', {
+              layanan: item.layanan || 1,
+              sub_layanan: item.sub_layanan || 1,
+              posisi_berkas: item.posisi_berkas || 'VERIFIKASI_BERKAS_KECAMATAN',
+              antrean: 0,
+              camat_hadir: camatHadirRealtime,
+              jam: now.getHours(),
+              hari: now.getDay(),
+            });
+            if (ml?.data?.predicted_minutes) predMinutes = ml.data.predicted_minutes;
+
+            if (item.posisi_berkas === 'MENUNGGU_TTD_CAMAT' && camatHadirRealtime === 0) {
+              predMinutes += 1440;
+            }
+          }
+        } catch (_) {
+          // fallback ke nilai tersimpan
+        }
+
+        let sisa = predMinutes;
+        let estimasiSelesai = null;
+        try {
+          if (item.waktu_masuk_tahap_ini) {
+            const start = item.waktu_masuk_tahap_ini.toDate ? item.waktu_masuk_tahap_ini.toDate() : new Date(item.waktu_masuk_tahap_ini._seconds * 1000);
+            estimasiSelesai = new Date(start.getTime() + predMinutes * 60000);
+            sisa = Math.max(0, Math.round((estimasiSelesai - new Date()) / 60000));
+          }
+        } catch (_) {}
+
+        return {
+          ...item,
+          kalkulasi_sla: {
+            estimasi_selesai: estimasiSelesai,
+            sisa_waktu_menit: sisa,
+            status_peringatan: sisa <= 15 ? 'Kritis' : 'Aman',
+          },
+        };
+      })
+    );
+
+    res.status(200).json({ success: true, data: enriched, total, page: pageNum, limit: limitNum });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -454,6 +626,39 @@ router.get('/berkas/stats', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ======================================================================
+// 6. ENDPOINT COMPATIBILITY FE MOBILE (/predict)
+// ======================================================================
+router.post('/predict', async (req, res) => {
+  try {
+    const { id_layanan, id_sub_layanan, layanan, sub_layanan, beban_staf = 0, status_camat = 1, posisi_berkas } = req.body || {};
+    const d = new Date();
+
+    const mlResp = await axios.post('http://localhost:8000/predict/kecamatan', {
+      layanan: layanan || id_layanan || 1,
+      sub_layanan: sub_layanan || id_sub_layanan || 1,
+      posisi_berkas: posisi_berkas || 'VERIFIKASI_BERKAS_KECAMATAN',
+      antrean: beban_staf,
+      camat_hadir: status_camat,
+      jam: d.getHours(),
+      hari: d.getDay(),
+    });
+
+    return res.status(200).json({ success: true, data: mlResp.data });
+  } catch (error) {
+    return res.status(200).json({
+      success: true,
+      data: {
+        predicted_minutes: 45,
+        range: '40 - 50 menit',
+        factors: ['ML offline, fallback backend aktif'],
+      },
+      fallback: true,
+      message: error.message,
+    });
   }
 });
 
